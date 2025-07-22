@@ -17,6 +17,7 @@
         devShells.default = with pkgs; mkShell {
           buildInputs = [
             pkg-config
+            fuse
             rustup
             rust-bin.stable.latest.default
           ];
