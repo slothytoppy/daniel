@@ -1,7 +1,7 @@
 pub mod daniel;
-pub mod dir_entry;
+pub mod file_types;
 pub mod metadata;
 
 pub use daniel::*;
-pub use dir_entry::*;
+pub use file_types::*;
 pub use metadata::*;

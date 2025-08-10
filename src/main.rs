@@ -10,7 +10,7 @@ fn main() {
     let _ = tracing_subscriber::FmtSubscriber::builder()
         .with_ansi(true)
         .with_max_level(LevelFilter::INFO)
-        .with_span_events(FmtSpan::ENTER)
+        .with_span_events(FmtSpan::ACTIVE)
         .finish()
         .try_init();
 

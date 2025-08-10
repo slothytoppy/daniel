@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, btree_map::Iter},
     num::NonZeroU64,
     ops::Add,
     path::{Path, PathBuf},
@@ -9,25 +9,23 @@ use std::{
 };
 
 use fuser::{FileAttr, FileType};
-use tracing::info;
+
+use super::ROOT_INODE;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug, Hash)]
 pub struct Inode(NonZeroU64);
 
 impl Inode {
-    pub fn new(ino: NonZeroU64) -> Self {
+    pub const fn new(ino: NonZeroU64) -> Self {
         Self(ino)
     }
 }
 
 impl TryFrom<u64> for Inode {
     type Error = ();
-    fn try_from(value: u64) -> Result<Self, Self::Error> {
-        if value == 0 {
-            return Err(());
-        }
 
-        Ok(Inode::new(value.try_into().unwrap()))
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Ok(Self(NonZeroU64::new(value).unwrap()))
     }
 }
 
@@ -51,8 +49,120 @@ impl Add<NonZeroU64> for Inode {
     }
 }
 
+#[macro_export]
+macro_rules! nonzero_u64 {
+    ($val:expr) => {{
+        use std::num::NonZeroU64;
+        assert!($val != 0);
+        NonZeroU64::new($val).unwrap()
+    }};
+}
+
+#[macro_export]
+macro_rules! unchecked_inode {
+    ($val:expr) => {{
+        assert!($val != 0);
+        use super::Inode;
+        use std::num::NonZeroU64;
+        Inode::new(NonZeroU64::new($val).unwrap())
+    }};
+}
+
 #[derive(Debug)]
+pub struct InodeMapper {
+    paths: BTreeMap<PathBuf, Inode>,
+    map: BTreeMap<(Inode, PathBuf), Inode>,
+    /// if inode is removed, it sets it to that inode, else its the last inode + 1
+    next_inode: Inode,
+}
+
+impl Default for InodeMapper {
+    fn default() -> Self {
+        let mut map = BTreeMap::new();
+        map.insert((ROOT_INODE, "/".into()), ROOT_INODE);
+        let mut paths = BTreeMap::new();
+        paths.insert("/".into(), ROOT_INODE);
+
+        Self {
+            paths,
+            map,
+            next_inode: unchecked_inode!(2),
+        }
+    }
+}
+
+impl InodeMapper {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn map(&self) -> Iter<(Inode, PathBuf), Inode> {
+        self.map.iter()
+    }
+
+    pub fn insert(&mut self, parent: Inode, path: impl AsRef<Path>, inode: Inode) {
+        self.map
+            .insert((parent, path.as_ref().to_path_buf()), inode);
+
+        self.paths.insert(path.as_ref().to_path_buf(), inode);
+
+        self.next_inode = self.next_inode.add(nonzero_u64!(1));
+    }
+
+    pub fn remove(&mut self, parent: Inode, path: impl AsRef<Path>) {
+        self.map.remove(&(parent, path.as_ref().to_path_buf()));
+        self.paths.remove(&path.as_ref().to_path_buf());
+    }
+
+    pub fn get_map(&self, parent: Inode, path: impl AsRef<Path>) -> Option<&Inode> {
+        self.map.get(&(parent, path.as_ref().to_path_buf()))
+    }
+
+    pub fn get_path(&self, path: impl AsRef<Path>) -> Option<&Inode> {
+        self.paths.get(&path.as_ref().to_path_buf())
+    }
+
+    pub fn next_inode(&self) -> Inode {
+        self.next_inode
+    }
+}
+
+impl std::fmt::Display for InodeMapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "InodeMapper ")?;
+        let mut iter = self.map.iter();
+        let mut len = iter.len();
+
+        loop {
+            let sep = if len > 1 { "," } else { " " };
+            match iter.next() {
+                Some(((parent, path), inode)) => write!(
+                    f,
+                    "path: {:?} parent: {:?} inode: {:?}{sep} ",
+                    path.display(),
+                    parent,
+                    inode
+                )?,
+                None => {
+                    write!(f, " ")?;
+                    break;
+                }
+            }
+            len -= 1;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct FileAttribute(FileAttr);
+
+impl From<FileAttribute> for FileAttr {
+    fn from(value: FileAttribute) -> Self {
+        value.0
+    }
+}
 
 impl FileAttribute {
     pub fn new(ino: u64, kind: FileType, perm: u16) -> Self {
@@ -78,70 +188,12 @@ impl FileAttribute {
         Self(attr)
     }
 
-    pub fn inner(&self) -> &FileAttr {
-        &self.0
+    pub fn inner(&self) -> FileAttr {
+        self.0
     }
 
     pub fn inner_mut(&mut self) -> &mut FileAttr {
         &mut self.0
-    }
-}
-
-#[derive(Debug)]
-pub struct InodeList {
-    inodes: BTreeMap<PathBuf, Inode>,
-}
-
-impl Default for InodeList {
-    fn default() -> Self {
-        let mut inodes = BTreeMap::new();
-
-        inodes.insert("/".into(), Inode::new(1.try_into().unwrap()));
-
-        Self { inodes }
-    }
-}
-
-impl InodeList {
-    fn contains_key(&self, path: PathBuf) -> bool {
-        self.inodes.contains_key(&path)
-    }
-
-    fn contains_inode(&self, inode: Inode) -> bool {
-        for (_, ino) in self.inodes.iter() {
-            if ino == &inode {
-                return true;
-            }
-        }
-
-        false
-    }
-
-    pub fn push(&mut self, path: impl Into<PathBuf>) -> Inode {
-        let value = self
-            .inodes
-            .last_key_value()
-            .expect("root node was somehow removed :3")
-            .1
-            .add(1.try_into().unwrap());
-        let path = path.into();
-
-        info!(?path, ?value);
-        info!(?self);
-
-        if !self.inodes.contains_key(&path) {
-            return self.inodes.insert(path, value).unwrap_or(value);
-        }
-
-        value
-    }
-
-    pub fn inner(&self) -> &BTreeMap<PathBuf, Inode> {
-        &self.inodes
-    }
-
-    pub fn inner_mut(&mut self) -> &mut BTreeMap<PathBuf, Inode> {
-        &mut self.inodes
     }
 }
 
@@ -154,7 +206,7 @@ impl Attr {
     pub fn new() -> Self {
         let mut map = BTreeMap::new();
         map.insert(
-            Inode::new(1.try_into().unwrap()),
+            ROOT_INODE,
             FileAttribute::new(1, FileType::Directory, 0o755),
         );
 
@@ -163,9 +215,8 @@ impl Attr {
 
     pub fn push(&mut self, ino: Inode, perms: u16, kind: FileType) -> &FileAttribute {
         self.attrs
-            .insert(ino, FileAttribute::new(ino.0.get(), kind, perms));
-
-        self.attrs.get(&ino).unwrap()
+            .entry(ino)
+            .or_insert(FileAttribute::new(ino.0.get(), kind, perms))
     }
 
     pub fn entries(&self) -> &BTreeMap<Inode, FileAttribute> {
@@ -174,53 +225,5 @@ impl Attr {
 
     pub fn entries_mut(&mut self) -> &mut BTreeMap<Inode, FileAttribute> {
         &mut self.attrs
-    }
-}
-
-#[derive(Debug)]
-pub struct MetaData {
-    inodes: InodeList,
-    attrs: Attr,
-}
-
-impl Default for MetaData {
-    fn default() -> Self {
-        let mut inodes = InodeList::default();
-        Self {
-            inodes,
-            attrs: Attr::new(),
-        }
-    }
-}
-
-impl MetaData {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn push(&mut self, path: &Path, kind: FileType, perms: u16) -> Inode {
-        if !self.inodes.contains_key(path.to_path_buf()) {
-            let entry = self
-                .inodes
-                .inodes
-                .last_entry()
-                .unwrap()
-                .get()
-                .add(1.try_into().unwrap());
-            info!(?entry);
-            let ino = self.inodes.push(path);
-            self.attrs.push(entry, perms, kind);
-            return ino;
-        }
-
-        *self.inodes.inodes.get(&path.to_path_buf()).unwrap()
-    }
-
-    pub fn inodes(&self) -> &InodeList {
-        &self.inodes
-    }
-
-    pub fn attributes(&self) -> &Attr {
-        &self.attrs
     }
 }

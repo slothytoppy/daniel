@@ -25,7 +25,6 @@ name = "daniel"
 version = "0.1.0"
 dependencies = [
  "fuser",
- "libc",
  "tracing",
  "tracing-subscriber",
 ]

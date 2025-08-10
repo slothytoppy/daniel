@@ -1,97 +1,27 @@
 use std::{
-    collections::BTreeMap,
-    num::NonZeroU64,
-    path::{Path, PathBuf},
-    time::{self, Duration, SystemTime},
+    ffi::c_int,
+    num::NonZero,
+    ops::ControlFlow,
+    path::Path,
+    time::{self, Duration},
 };
 
 use fuser::FileType;
-use libc::{EEXIST, ENOENT, ENOSYS};
-use tracing::{error, info, instrument, warn};
+static EPERM: i32 = 1;
+static ENOENT: i32 = 2;
+static ENOSYS: i32 = 38;
+use tracing::{debug, error, info, instrument, warn};
 
-use super::{Attr, DirEntry, Directory, File, FileAttribute, Inode, InodeList, MetaData};
+use crate::{filesystem::EntryType, unchecked_inode};
 
-#[derive(Default, Debug)]
-pub struct DirEntries {
-    entries: BTreeMap<Inode, DirEntry>,
-}
+use super::{DirEntry, DirList, Directory, FileAttribute, Inode, InodeMapper, file_types::File};
 
-impl DirEntries {
-    pub fn insert(&mut self, inode: Inode, entry: DirEntry) {
-        self.entries.insert(inode, entry);
-    }
-}
-
-#[derive(Debug)]
-pub struct Root {
-    attr: FileAttribute,
-    inodes: InodeList,
-    entries: DirEntries,
-    attributes: Attr,
-}
-
-impl Default for Root {
-    fn default() -> Self {
-        Self {
-            attr: FileAttribute::new(1, FileType::Directory, 0o755),
-            inodes: InodeList::default(),
-            entries: DirEntries::default(),
-            attributes: Attr::new(),
-        }
-    }
-}
-
-impl Root {
-    pub fn entries(&self) -> &DirEntries {
-        &self.entries
-    }
-
-    pub fn entries_mut(&mut self) -> &mut DirEntries {
-        &mut self.entries
-    }
-
-    pub fn inodes(&self) -> &InodeList {
-        &self.inodes
-    }
-
-    pub fn attributes(&self) -> &FileAttribute {
-        &self.attr
-    }
-
-    pub fn push(
-        &mut self,
-        parent: Option<Inode>,
-        path: impl AsRef<Path>,
-        kind: FileType,
-        perms: u16,
-    ) -> (Inode, &FileAttribute) {
-        let path = path.as_ref();
-        let ino = self.inodes.push(path);
-        let attr = self.attributes.push(ino, perms, kind);
-        match kind {
-            FileType::Directory => {
-                self.entries.insert(
-                    ino,
-                    DirEntry::Directory(Directory::new(parent.unwrap(), Some(path.into()))),
-                );
-            }
-            FileType::RegularFile => {
-                self.entries
-                    .insert(ino, DirEntry::File(File::new(parent.unwrap(), path)));
-            }
-
-            _ => todo!(),
-        }
-
-        (ino, attr)
-    }
-}
+pub const ROOT_INODE: Inode = Inode::new(NonZero::new(1).unwrap());
 
 #[derive(Debug, Default)]
 pub struct Daniel {
-    metadata: MetaData,
-    root: Root,
-    dir_entries: BTreeMap<Inode, DirEntry>,
+    mapper: InodeMapper,
+    list: DirList,
 }
 
 impl Daniel {
@@ -99,160 +29,182 @@ impl Daniel {
         Self::default()
     }
 
-    pub fn root(&self) -> &Root {
-        &self.root
+    pub fn push(&mut self, item: DirEntry) {
+        let (parent, name, ino) = match &item {
+            DirEntry::Directory(dir) => {
+                let name = dir.name();
+                let parent = dir.parent();
+                (parent, name, dir.attr().inner().ino)
+            }
+            DirEntry::File(file) => {
+                let name = file.name();
+                let parent = file.parent();
+                (parent, name, file.attr().inner().ino)
+            }
+        };
+
+        let ino = unchecked_inode!(ino);
+        self.mapper.insert(parent, name, ino);
+
+        self.list
+            .map_mut()
+            .get_mut(&parent)
+            .expect("failed to get dir")
+            .directory_mut()
+            .insert(
+                ino,
+                item.kind()
+                    .try_into()
+                    .expect("failed to convert file type into EntryType"),
+            );
+
+        self.list.map_mut().insert(ino, item);
+    }
+
+    pub fn create(
+        &mut self,
+        parent: Inode,
+        path: impl AsRef<Path>,
+        _mode: u16,
+        perms: u16,
+    ) -> FileAttribute {
+        let inode = self.mapper.next_inode();
+        self.push(DirEntry::File(File::new(
+            path.as_ref().to_path_buf(),
+            parent,
+            inode,
+            perms,
+        )));
+
+        self.list
+            .map()
+            .get(&inode)
+            .expect("failed to get entry that was just pushed")
+            .file()
+            .attr()
+    }
+
+    fn mkdir(
+        &mut self,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        mode: u32,
+        umask: u32,
+    ) -> FileAttribute {
+        let inode = self.mapper.next_inode();
+        self.push(DirEntry::Directory(Directory::new(
+            unchecked_inode!(parent),
+            name.into(),
+            inode,
+            0o755,
+        )));
+
+        self.list
+            .map()
+            .get(&inode)
+            .expect("failed to get entry that was just pushed")
+            .directory()
+            .attr()
+    }
+
+    pub fn readdir(&self, ino: u64, _fh: u64, offset: u64) -> ControlFlow<(), &DirEntry> {
+        let Some(entry) = self.list.map().get(&unchecked_inode!(ino)) else {
+            return ControlFlow::Break(());
+        };
+
+        match entry {
+            DirEntry::Directory(_directory) => {
+                let idx = offset.max(1);
+                let Some(entry) = self.list.map().get(&unchecked_inode!(idx)) else {
+                    return ControlFlow::Break(());
+                };
+
+                ControlFlow::Continue(entry)
+            }
+            DirEntry::File(_file) => ControlFlow::Break(()),
+        }
+    }
+
+    pub fn lookup(&mut self, parent: u64, name: &std::ffi::OsStr) -> Result<FileAttribute, ()> {
+        for (ino, _) in self
+            .list
+            .map()
+            .get(&unchecked_inode!(parent))
+            .expect("failed to get dir")
+            .directory()
+            .entries()
+            .iter()
+        {
+            let (path, attr) = match self.list.map().get(&ino).expect("invalid entry in dir") {
+                DirEntry::Directory(directory) => (directory.name(), directory.attr()),
+                DirEntry::File(file) => (file.name(), file.attr()),
+            };
+
+            if path == name {
+                return Ok(attr);
+            }
+        }
+
+        Err(())
+    }
+
+    pub fn access(&mut self, ino: u64, mask: i32) -> Result<(), ()> {
+        match self.list.map().get(&unchecked_inode!(ino)) {
+            Some(_) => Ok(()),
+            None => Err(()),
+        }
+    }
+
+    pub fn getattr(&mut self, ino: u64, fh: Option<u64>) -> &FileAttribute {
+        self.list
+            .map()
+            .get(&unchecked_inode!(ino))
+            .expect("failed to find ino in backing fs")
+            .attr()
+    }
+
+    pub fn unlink(&mut self, parent: u64, name: &std::ffi::OsStr) -> Result<(), ()> {
+        let ino = self
+            .mapper
+            .get_map(unchecked_inode!(parent), name)
+            .expect("failed to find inode");
+        self.list.map_mut().remove(ino);
+        self.mapper.remove(unchecked_inode!(parent), name);
+
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for Daniel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.mapper)?;
+        write!(f, "{}", self.list)?;
+
+        Ok(())
     }
 }
 
 impl fuser::Filesystem for Daniel {
-    #[instrument(skip(self, _req))]
-    fn init(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        _config: &mut fuser::KernelConfig,
-    ) -> Result<(), libc::c_int> {
-        Ok(())
-    }
-
-    #[instrument(skip(self))]
-    fn destroy(&mut self) {}
-
-    #[instrument(skip(self, reply, _req))]
-    fn lookup(
-        &mut self,
-        _req: &fuser::Request,
-        parent: u64,
-        name: &std::ffi::OsStr,
-        reply: fuser::ReplyEntry,
-    ) {
-        match parent {
-            1 => {
-                let Some(ino) = self
-                    .root
-                    .inodes
-                    .inner()
-                    .get(&PathBuf::from(name.to_str().unwrap()))
-                else {
-                    reply.error(ENOENT);
-                    return;
-                };
-
-                let ttl = Duration::from_secs(1);
-                let attr = self
-                    .root
-                    .attributes
-                    .entries()
-                    .get(ino)
-                    .expect("inode from attribute list does not exist");
-
-                reply.entry(&ttl, attr.inner(), 0);
-            }
-
-            _ => {
-                todo!("unimplemented non parent inode lookup")
-            }
-        }
-    }
-
-    #[instrument(skip(self, _req))]
-    fn forget(&mut self, _req: &fuser::Request<'_>, _ino: u64, _nlookup: u64) {}
-
     #[instrument(skip(self, _req, reply))]
-    fn getattr(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        fh: Option<u64>,
-        reply: fuser::ReplyAttr,
-    ) {
-        let attr = self
-            .metadata
-            .attributes()
-            .entries()
-            .get(&Inode::new(NonZeroU64::new(ino).unwrap()))
-            .unwrap();
-
-        let ttl = Duration::new(1, 0);
-        reply.attr(&ttl, attr.inner());
-    }
-
-    #[instrument(skip_all)]
-    fn setattr(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
-        _size: Option<u64>,
-        atime: Option<fuser::TimeOrNow>,
-        mtime: Option<fuser::TimeOrNow>,
-        ctime: Option<time::SystemTime>,
-        _fh: Option<u64>,
-        _crtime: Option<time::SystemTime>,
-        _chgtime: Option<time::SystemTime>,
-        _bkuptime: Option<time::SystemTime>,
-        _flags: Option<u32>,
-        reply: fuser::ReplyAttr,
-    ) {
-        let attr = self
-            .root
-            .attributes
-            .entries_mut()
-            .get_mut(&ino.try_into().unwrap())
-            .expect("failed to retrieve attributes for setattr");
-        if let Some(atime) = atime {
-            match atime {
-                fuser::TimeOrNow::SpecificTime(system_time) => {
-                    attr.inner_mut().atime = system_time;
-                }
-                fuser::TimeOrNow::Now => {
-                    attr.inner_mut().atime = SystemTime::now();
-                }
-            }
-        }
-
-        if let Some(atime) = ctime {
-            attr.inner_mut().ctime = atime;
-        }
-
-        if let Some(atime) = mtime {
-            match atime {
-                fuser::TimeOrNow::SpecificTime(system_time) => {
-                    attr.inner_mut().mtime = system_time;
-                }
-                fuser::TimeOrNow::Now => {
-                    attr.inner_mut().mtime = SystemTime::now();
-                }
-            }
-        }
-
-        reply.attr(&Duration::from_secs(1), attr.inner());
-    }
-
-    #[instrument(skip_all)]
-    fn readlink(&mut self, _req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyData) {
-        info!("[Not Implemented] readlink(ino: {:#x?})", ino);
-        reply.error(libc::ENOSYS);
-    }
-
-    #[instrument(skip_all)]
-    fn mknod(
+    fn create(
         &mut self,
         _req: &fuser::Request<'_>,
         parent: u64,
         name: &std::ffi::OsStr,
         mode: u32,
         umask: u32,
-        rdev: u32,
-        reply: fuser::ReplyEntry,
+        flags: i32,
+        reply: fuser::ReplyCreate,
     ) {
-        info!(
-            "[Not Implemented] mknod(parent: {:#x?}, name: {:?}, mode: {}, \
-            umask: {:#x?}, rdev: {})",
-            parent, name, mode, umask, rdev
+        reply.created(
+            &Duration::from_secs(1),
+            &self
+                .create(unchecked_inode!(parent), name, mode as u16, flags as u16)
+                .inner(),
+            0,
+            0,
+            flags as u32,
         );
-        reply.error(libc::ENOSYS);
     }
 
     #[instrument(skip(self, _req, reply))]
@@ -265,25 +217,101 @@ impl fuser::Filesystem for Daniel {
         umask: u32,
         reply: fuser::ReplyEntry,
     ) {
-        match self.root.inodes.inner().get(&PathBuf::from(name)) {
-            Some(_ino) => {
-                reply.error(EEXIST);
-            }
+        reply.entry(
+            &Duration::from_secs(1),
+            &self.mkdir(parent, name, mode, umask).inner(),
+            0,
+        );
+    }
 
-            None => {
-                let ino = self.root.push(
-                    Some(parent.try_into().unwrap()),
-                    Path::new(name),
-                    FileType::Directory,
-                    0o755,
-                );
+    #[instrument(skip(self, _req, reply))]
+    fn readdir(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        mut reply: fuser::ReplyDirectory,
+    ) {
+        info!(?offset);
+        if offset > 50 {
+            panic!()
+        }
 
-                reply.entry(&time::Duration::new(1, 0), ino.1.inner(), 0);
+        if offset == 0 {
+            _ = reply.add(1, 1, FileType::Directory, ".");
+        } else if offset == 1 {
+            _ = reply.add(1, 2, FileType::Directory, "..");
+        }
+
+        let dir = self
+            .list
+            .map()
+            .get(&unchecked_inode!(ino))
+            .expect("failed to get dir in readdir");
+        for (i, (ino, kind)) in dir
+            .directory()
+            .entries()
+            .iter()
+            .enumerate()
+            .skip(offset as usize)
+        {
+            let Some(entry) = self.list.map().get(ino) else {
+                reply.error(ENOENT);
+                return;
+            };
+
+            let name = match entry {
+                DirEntry::Directory(directory) => directory.name(),
+                DirEntry::File(file) => file.name(),
+            };
+
+            info!(?offset, ?name);
+            let kind = kind.clone();
+            if reply.add(ino.into(), (i + 1) as i64, kind.into(), name) {
+                error!("early return");
+                break;
             }
+        }
+
+        reply.ok();
+    }
+
+    #[instrument(skip(self, _req, reply))]
+    fn lookup(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEntry,
+    ) {
+        let Ok(attr) = self.lookup(parent, name) else {
+            reply.error(ENOENT);
+            return;
+        };
+        reply.entry(&Duration::from_secs(1), &attr.inner(), 0);
+    }
+
+    #[instrument(skip(self, _req, reply))]
+    fn access(&mut self, _req: &fuser::Request<'_>, ino: u64, mask: i32, reply: fuser::ReplyEmpty) {
+        let res = self.access(ino, mask);
+        match res {
+            Ok(()) => reply.ok(),
+            Err(()) => reply.error(ENOENT),
         }
     }
 
-    #[instrument(skip_all)]
+    #[instrument(skip(self, _req, reply))]
+    fn getattr(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        fh: Option<u64>,
+        reply: fuser::ReplyAttr,
+    ) {
+        reply.attr(&Duration::from_secs(1), &self.getattr(ino, fh).inner());
+    }
+
     fn unlink(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -291,14 +319,96 @@ impl fuser::Filesystem for Daniel {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEmpty,
     ) {
-        info!(
-            "[Not Implemented] unlink(parent: {:#x?}, name: {:?})",
-            parent, name,
-        );
-        reply.error(libc::ENOSYS);
+        let res = self.unlink(parent, name);
+        match res {
+            Ok(()) => reply.ok(),
+            Err(()) => reply.error(ENOENT),
+        }
     }
 
-    #[instrument(skip_all)]
+    fn init(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _config: &mut fuser::KernelConfig,
+    ) -> Result<(), c_int> {
+        Ok(())
+    }
+
+    fn destroy(&mut self) {}
+
+    fn forget(&mut self, _req: &fuser::Request<'_>, _ino: u64, _nlookup: u64) {}
+
+    fn setattr(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+        ctime: Option<std::time::SystemTime>,
+        fh: Option<u64>,
+        _crtime: Option<std::time::SystemTime>,
+        _chgtime: Option<std::time::SystemTime>,
+        _bkuptime: Option<std::time::SystemTime>,
+        flags: Option<u32>,
+        reply: fuser::ReplyAttr,
+    ) {
+        let Some(entry) = self.list.map_mut().get_mut(&unchecked_inode!(ino)) else {
+            reply.error(ENOENT);
+            return;
+        };
+        let attr = entry.attr_mut().inner_mut();
+        if let Some(size) = size {
+            attr.size = size
+        };
+
+        if let Some(time) = atime {
+            attr.atime = match time {
+                fuser::TimeOrNow::SpecificTime(system_time) => system_time,
+                fuser::TimeOrNow::Now => time::SystemTime::now(),
+            }
+        };
+
+        if let Some(time) = mtime {
+            attr.mtime = match time {
+                fuser::TimeOrNow::SpecificTime(system_time) => system_time,
+                fuser::TimeOrNow::Now => time::SystemTime::now(),
+            }
+        };
+
+        if let Some(time) = ctime {
+            attr.ctime = time
+        };
+
+        reply.attr(&Duration::from_secs(1), attr);
+    }
+
+    fn readlink(&mut self, _req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyData) {
+        debug!("[Not Implemented] readlink(ino: {:#x?})", ino);
+        reply.error(ENOSYS);
+    }
+
+    fn mknod(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        mode: u32,
+        umask: u32,
+        rdev: u32,
+        reply: fuser::ReplyEntry,
+    ) {
+        debug!(
+            "[Not Implemented] mknod(parent: {:#x?}, name: {:?}, mode: {}, \
+            umask: {:#x?}, rdev: {})",
+            parent, name, mode, umask, rdev
+        );
+        reply.error(ENOSYS);
+    }
+
     fn rmdir(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -306,14 +416,13 @@ impl fuser::Filesystem for Daniel {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEmpty,
     ) {
-        info!(
+        debug!(
             "[Not Implemented] rmdir(parent: {:#x?}, name: {:?})",
             parent, name,
         );
-        reply.error(libc::ENOSYS);
+        reply.error(ENOSYS);
     }
 
-    #[instrument(skip_all)]
     fn symlink(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -322,14 +431,13 @@ impl fuser::Filesystem for Daniel {
         target: &Path,
         reply: fuser::ReplyEntry,
     ) {
-        info!(
+        debug!(
             "[Not Implemented] symlink(parent: {:#x?}, link_name: {:?}, target: {:?})",
             parent, link_name, target,
         );
-        reply.error(libc::EPERM);
+        reply.error(EPERM);
     }
 
-    #[instrument(skip_all)]
     fn rename(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -340,15 +448,14 @@ impl fuser::Filesystem for Daniel {
         flags: u32,
         reply: fuser::ReplyEmpty,
     ) {
-        info!(
+        debug!(
             "[Not Implemented] rename(parent: {:#x?}, name: {:?}, newparent: {:#x?}, \
             newname: {:?}, flags: {})",
             parent, name, newparent, newname, flags,
         );
-        reply.error(libc::ENOSYS);
+        reply.error(ENOSYS);
     }
 
-    #[instrument(skip_all)]
     fn link(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -357,19 +464,17 @@ impl fuser::Filesystem for Daniel {
         newname: &std::ffi::OsStr,
         reply: fuser::ReplyEntry,
     ) {
-        info!(
+        debug!(
             "[Not Implemented] link(ino: {:#x?}, newparent: {:#x?}, newname: {:?})",
             ino, newparent, newname
         );
-        reply.error(libc::EPERM);
+        reply.error(EPERM);
     }
 
-    #[instrument(skip(self, _req, reply))]
-    fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
-        reply.opened(2, _flags as u32);
+    fn open(&mut self, _req: &fuser::Request<'_>, _ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
+        reply.opened(0, 0);
     }
 
-    #[instrument(skip_all)]
     fn read(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -386,10 +491,9 @@ impl fuser::Filesystem for Daniel {
             flags: {:#x?}, lock_owner: {:?})",
             ino, fh, offset, size, flags, lock_owner
         );
-        reply.error(libc::ENOSYS);
+        reply.error(ENOSYS);
     }
 
-    #[instrument(skip_all)]
     fn write(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -402,7 +506,7 @@ impl fuser::Filesystem for Daniel {
         lock_owner: Option<u64>,
         reply: fuser::ReplyWrite,
     ) {
-        info!(
+        debug!(
             "[Not Implemented] write(ino: {:#x?}, fh: {}, offset: {}, data.len(): {}, \
             write_flags: {:#x?}, flags: {:#x?}, lock_owner: {:?})",
             ino,
@@ -413,10 +517,9 @@ impl fuser::Filesystem for Daniel {
             flags,
             lock_owner
         );
-        reply.error(libc::ENOSYS);
+        reply.error(ENOSYS);
     }
 
-    #[instrument(skip(self, _req, reply))]
     fn flush(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -425,10 +528,13 @@ impl fuser::Filesystem for Daniel {
         lock_owner: u64,
         reply: fuser::ReplyEmpty,
     ) {
+        debug!(
+            "[Not Implemented] flush(ino: {:#x?}, fh: {}, lock_owner: {:?})",
+            ino, fh, lock_owner
+        );
         reply.error(ENOSYS);
     }
 
-    #[instrument(skip(self, _req, reply))]
     fn release(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -439,10 +545,9 @@ impl fuser::Filesystem for Daniel {
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        reply.error(ENOSYS);
+        reply.ok();
     }
 
-    #[instrument(skip(self, _req, reply))]
     fn fsync(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -451,10 +556,13 @@ impl fuser::Filesystem for Daniel {
         datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        debug!(
+            "[Not Implemented] fsync(ino: {:#x?}, fh: {}, datasync: {})",
+            ino, fh, datasync
+        );
         reply.error(ENOSYS);
     }
 
-    #[instrument(skip(self, _req, reply))]
     fn opendir(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -462,53 +570,9 @@ impl fuser::Filesystem for Daniel {
         _flags: i32,
         reply: fuser::ReplyOpen,
     ) {
-        reply.opened(1, _flags as u32);
+        reply.opened(0, 0);
     }
 
-    #[instrument(skip(self, _req, reply))]
-    fn readdir(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
-        mut reply: fuser::ReplyDirectory,
-    ) {
-        let dir = self
-            .root
-            .entries
-            .entries
-            .get(&ino.try_into().unwrap())
-            .unwrap()
-            .dirent();
-
-        if offset == 0 {
-            info!("adding .");
-            reply.add(ino, 1, FileType::Directory, ".");
-        }
-
-        if offset == 1 {
-            info!("adding ..");
-            // first arg is parent inode
-            reply.add(dir.parent().into(), 2, FileType::Directory, "..");
-        }
-
-        for (i, ino) in dir.entries().enumerate().skip(offset as usize) {
-            let entry = self
-                .root
-                .entries
-                .entries
-                .get(ino)
-                .expect("failed to retrieve entry");
-            if reply.add(ino.into(), (i + 1) as i64, entry.kind(), entry.name()) {
-                break;
-            }
-        }
-
-        reply.ok();
-    }
-
-    #[instrument(skip(self, _req, reply))]
     fn readdirplus(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -517,10 +581,13 @@ impl fuser::Filesystem for Daniel {
         offset: i64,
         reply: fuser::ReplyDirectoryPlus,
     ) {
+        debug!(
+            "[Not Implemented] readdirplus(ino: {:#x?}, fh: {}, offset: {})",
+            ino, fh, offset
+        );
         reply.error(ENOSYS);
     }
 
-    #[instrument(skip(self, _req, reply))]
     fn releasedir(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -532,7 +599,6 @@ impl fuser::Filesystem for Daniel {
         reply.ok();
     }
 
-    #[instrument(skip(self, _req, reply))]
     fn fsyncdir(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -541,16 +607,17 @@ impl fuser::Filesystem for Daniel {
         datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        debug!(
+            "[Not Implemented] fsyncdir(ino: {:#x?}, fh: {}, datasync: {})",
+            ino, fh, datasync
+        );
         reply.error(ENOSYS);
     }
 
-    #[instrument(skip(self, _req, reply))]
     fn statfs(&mut self, _req: &fuser::Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
-        reply.error(ENOSYS);
-        // reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
+        reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
     }
 
-    #[instrument(skip(self, _req, reply))]
     fn setxattr(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -561,10 +628,13 @@ impl fuser::Filesystem for Daniel {
         position: u32,
         reply: fuser::ReplyEmpty,
     ) {
+        debug!(
+            "[Not Implemented] setxattr(ino: {:#x?}, name: {:?}, flags: {:#x?}, position: {})",
+            ino, name, flags, position
+        );
         reply.error(ENOSYS);
     }
 
-    #[instrument(skip(self, _req, reply))]
     fn getxattr(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -573,10 +643,13 @@ impl fuser::Filesystem for Daniel {
         size: u32,
         reply: fuser::ReplyXattr,
     ) {
+        debug!(
+            "[Not Implemented] getxattr(ino: {:#x?}, name: {:?}, size: {})",
+            ino, name, size
+        );
         reply.error(ENOSYS);
     }
 
-    #[instrument(skip(self, _req, reply))]
     fn listxattr(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -584,10 +657,13 @@ impl fuser::Filesystem for Daniel {
         size: u32,
         reply: fuser::ReplyXattr,
     ) {
+        debug!(
+            "[Not Implemented] listxattr(ino: {:#x?}, size: {})",
+            ino, size
+        );
         reply.error(ENOSYS);
     }
 
-    #[instrument(skip_all)]
     fn removexattr(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -595,45 +671,13 @@ impl fuser::Filesystem for Daniel {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEmpty,
     ) {
-        info!(
+        debug!(
             "[Not Implemented] removexattr(ino: {:#x?}, name: {:?})",
             ino, name
         );
-        reply.error(libc::ENOSYS);
+        reply.error(ENOSYS);
     }
 
-    #[instrument(skip(self, _req, reply))]
-    fn access(&mut self, _req: &fuser::Request<'_>, ino: u64, mask: i32, reply: fuser::ReplyEmpty) {
-        reply.ok();
-    }
-
-    #[instrument(skip(self, _req, reply))]
-    fn create(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        parent: u64,
-        name: &std::ffi::OsStr,
-        mode: u32,
-        umask: u32,
-        flags: i32,
-        reply: fuser::ReplyCreate,
-    ) {
-        info!("creating file");
-        let (_, attr) = self.root.push(
-            Some(parent.try_into().unwrap()),
-            name,
-            FileType::RegularFile,
-            0o655,
-        );
-
-        let ttl = Duration::new(1, 0);
-        let inner = attr.inner();
-
-        info!(?inner);
-        reply.created(&ttl, inner, 0, 0, 0o655);
-    }
-
-    #[instrument(skip_all)]
     fn getlk(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -646,15 +690,14 @@ impl fuser::Filesystem for Daniel {
         pid: u32,
         reply: fuser::ReplyLock,
     ) {
-        info!(
+        debug!(
             "[Not Implemented] getlk(ino: {:#x?}, fh: {}, lock_owner: {}, start: {}, \
             end: {}, typ: {}, pid: {})",
             ino, fh, lock_owner, start, end, typ, pid
         );
-        reply.error(libc::ENOSYS);
+        reply.error(ENOSYS);
     }
 
-    #[instrument(skip_all)]
     fn setlk(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -668,15 +711,14 @@ impl fuser::Filesystem for Daniel {
         sleep: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        info!(
+        debug!(
             "[Not Implemented] setlk(ino: {:#x?}, fh: {}, lock_owner: {}, start: {}, \
             end: {}, typ: {}, pid: {}, sleep: {})",
             ino, fh, lock_owner, start, end, typ, pid, sleep
         );
-        reply.error(libc::ENOSYS);
+        reply.error(ENOSYS);
     }
 
-    #[instrument(skip_all)]
     fn bmap(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -685,14 +727,13 @@ impl fuser::Filesystem for Daniel {
         idx: u64,
         reply: fuser::ReplyBmap,
     ) {
-        info!(
+        debug!(
             "[Not Implemented] bmap(ino: {:#x?}, blocksize: {}, idx: {})",
             ino, blocksize, idx,
         );
-        reply.error(libc::ENOSYS);
+        reply.error(ENOSYS);
     }
 
-    #[instrument(skip_all)]
     fn ioctl(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -704,7 +745,7 @@ impl fuser::Filesystem for Daniel {
         out_size: u32,
         reply: fuser::ReplyIoctl,
     ) {
-        info!(
+        debug!(
             "[Not Implemented] ioctl(ino: {:#x?}, fh: {}, flags: {}, cmd: {}, \
             in_data.len(): {}, out_size: {})",
             ino,
@@ -714,10 +755,9 @@ impl fuser::Filesystem for Daniel {
             in_data.len(),
             out_size,
         );
-        reply.error(libc::ENOSYS);
+        reply.error(ENOSYS);
     }
 
-    #[instrument(skip_all)]
     fn fallocate(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -728,15 +768,14 @@ impl fuser::Filesystem for Daniel {
         mode: i32,
         reply: fuser::ReplyEmpty,
     ) {
-        info!(
+        debug!(
             "[Not Implemented] fallocate(ino: {:#x?}, fh: {}, offset: {}, \
             length: {}, mode: {})",
             ino, fh, offset, length, mode
         );
-        reply.error(libc::ENOSYS);
+        reply.error(ENOSYS);
     }
 
-    #[instrument(skip_all)]
     fn lseek(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -746,14 +785,13 @@ impl fuser::Filesystem for Daniel {
         whence: i32,
         reply: fuser::ReplyLseek,
     ) {
-        info!(
+        debug!(
             "[Not Implemented] lseek(ino: {:#x?}, fh: {}, offset: {}, whence: {})",
             ino, fh, offset, whence
         );
-        reply.error(libc::ENOSYS);
+        reply.error(ENOSYS);
     }
 
-    #[instrument(skip_all)]
     fn copy_file_range(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -767,12 +805,142 @@ impl fuser::Filesystem for Daniel {
         flags: u32,
         reply: fuser::ReplyWrite,
     ) {
-        info!(
+        debug!(
             "[Not Implemented] copy_file_range(ino_in: {:#x?}, fh_in: {}, \
             offset_in: {}, ino_out: {:#x?}, fh_out: {}, offset_out: {}, \
             len: {}, flags: {})",
             ino_in, fh_in, offset_in, ino_out, fh_out, offset_out, len, flags
         );
-        reply.error(libc::ENOSYS);
+        reply.error(ENOSYS);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::ops::ControlFlow;
+
+    use tracing::{info, instrument, level_filters::LevelFilter};
+    use tracing_subscriber::{fmt::format::FmtSpan, util::SubscriberInitExt};
+
+    use crate::{
+        filesystem::{DirEntry, Directory, EntryType, File},
+        unchecked_inode,
+    };
+
+    use super::{Daniel, ROOT_INODE};
+
+    fn init() {
+        let _ = tracing_subscriber::FmtSubscriber::builder()
+            .with_ansi(true)
+            .with_max_level(LevelFilter::INFO)
+            .with_span_events(FmtSpan::ACTIVE)
+            .finish()
+            .try_init();
+    }
+
+    #[test]
+    #[instrument]
+    pub fn default() {
+        init();
+        let fs = Daniel::default();
+
+        assert_eq!(fs.mapper.map().len(), 1);
+        assert_eq!(fs.list.map().len(), 1);
+
+        info!(%fs);
+    }
+
+    #[test]
+    #[instrument]
+    pub fn empty_dir() {
+        init();
+
+        let mut fs = Daniel::default();
+        fs.push(DirEntry::Directory(Directory::new(
+            ROOT_INODE,
+            "foo".into(),
+            unchecked_inode!(2),
+            0o755,
+        )));
+
+        assert_eq!(fs.mapper.map().len(), 2);
+        assert_eq!(fs.list.map().len(), 2);
+
+        info!(%fs);
+    }
+
+    #[test]
+    #[instrument]
+    pub fn filled_dir() {
+        init();
+
+        let _s = tracing::info_span!("filled_dir");
+        let _s = _s.entered();
+
+        let mut fs = Daniel::default();
+
+        fs.push(DirEntry::Directory(Directory::new(
+            ROOT_INODE,
+            "foo".into(),
+            unchecked_inode!(2),
+            0o755,
+        )));
+
+        let map = &fs.mapper;
+        let list = &fs.list;
+
+        info!(%map);
+        info!(%list);
+
+        let entry = fs
+            .list
+            .map_mut()
+            .get_mut(&unchecked_inode!(2))
+            .unwrap()
+            .directory_mut();
+
+        entry.insert(unchecked_inode!(3), EntryType::File);
+
+        fs.push(DirEntry::File(File::new(
+            "bar".into(),
+            unchecked_inode!(2),
+            unchecked_inode!(3),
+            0o655,
+        )));
+
+        assert_eq!(fs.mapper.map().len(), 3);
+        assert_eq!(fs.list.map().len(), 3);
+
+        info!(%fs);
+    }
+
+    #[test]
+    #[instrument]
+    fn readdir() {
+        init();
+
+        let _s = tracing::info_span!("readdir");
+        let _s = _s.entered();
+
+        let mut fs = Daniel::new();
+
+        fs.push(DirEntry::File(File::new(
+            "foo".into(),
+            ROOT_INODE,
+            unchecked_inode!(2),
+            0o655,
+        )));
+
+        let entry = fs.readdir(ROOT_INODE.into(), 0, 0);
+        match entry {
+            ControlFlow::Continue(entry) => match entry {
+                DirEntry::Directory(directory) => {
+                    let first = directory.entries().values().next().unwrap();
+                    assert_eq!(first, &EntryType::File);
+                }
+                DirEntry::File(_file) => panic!("expected ROOT dir found file"),
+            },
+            ControlFlow::Break(_) => panic!(),
+        }
     }
 }
